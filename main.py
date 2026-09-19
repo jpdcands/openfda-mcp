@@ -1,5 +1,6 @@
 from fastmcp import FastMCP
 from openfda_client import search_drug_label, search_adverse_events
+import os
 
 mcp = FastMCP("OpenFDA MCP Server")
 
@@ -25,4 +26,11 @@ async def get_adverse_events(drug_name: str, limit: int = 5) -> dict:
     return result["results"]
 
 if __name__ == "__main__":
-    mcp.run()
+    if os.getenv("MCP_TRANSPORT") == "http":
+        mcp.run(
+            transport="http",
+            host="127.0.0.1",
+            port=int(os.getenv("PORT", "8001")),
+        )
+    else:
+        mcp.run()
