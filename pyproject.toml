@@ -5,7 +5,7 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    "fastmcp[tasks]>=4,<5",
+    "fastmcp>=3.4.5",
     "httpx>=0.28.1",
     "python-dotenv>=1.2.2",
 ]
