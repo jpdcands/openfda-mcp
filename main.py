@@ -1,42 +1,36 @@
-from dotenv import load_dotenv
-import os
-import httpx
 from fastmcp import FastMCP
-
-load_dotenv()
-API_KEY = os.getenv("OPENFDA_API_KEY")
-
+from openfda_client import search_drug_label, search_adverse_events
+import os
 
 mcp = FastMCP("OpenFDA MCP Server")
 
 @mcp.tool()
-async def get_label_section(drug_name: str, section: str) -> str:
+async def get_drug_label(drug_name: str) -> dict:
     """
-    Pull a specific section (e.g. 'warnings', 'dosage_and_administration',
-    'contraindications') from a drug's FDA label.
+    Look up FDA label information for a drug by brand or generic name.
+    Returns indications, warnings, dosage, and contraindications.
     """
-    url = "https://api.fda.gov/drug/label.json"
-    params = {
-        "search": f'openfda.brand_name:"{drug_name}"',
-        "limit": 1,
-        "api_key": API_KEY,
-    }
+    result = await search_drug_label(drug_name)
+    if not result.get("results"):
+        return {"error": f"No label found for '{drug_name}'"}
+    return result["results"][0]
 
-    async with httpx.AsyncClient() as client:
-        response = await client.get(url, params=params)
-        response.raise_for_status()
-        data = response.json()
-
-    results = data.get("results", [])
-    if not results:
-        return f"No label found for '{drug_name}'."
-
-    section_data = results[0].get(section)
-    if not section_data:
-        return f"No '{section}' section found for '{drug_name}'."
-
-    return "\n".join(section_data)
-
+@mcp.tool()
+async def get_adverse_events(drug_name: str, limit: int = 5) -> dict:
+    """
+    Retrieve recent adverse event reports for a drug from FAERS.
+    """
+    result = await search_adverse_events(drug_name, limit)
+    if not result.get("results"):
+        return {"error": f"No adverse event reports found for '{drug_name}'"}
+    return result["results"]
 
 if __name__ == "__main__":
-    mcp.run()
+    if os.getenv("MCP_TRANSPORT") == "http":
+        mcp.run(
+            transport="http",
+            host="127.0.0.1",
+            port=int(os.getenv("PORT", "8001")),
+        )
+    else:
+        mcp.run()
