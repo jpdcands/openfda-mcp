@@ -23,7 +23,11 @@ async def get_adverse_events(drug_name: str, limit: int = 5) -> dict:
     result = await search_adverse_events(drug_name, limit)
     if not result.get("results"):
         return {"error": f"No adverse event reports found for '{drug_name}'"}
-    return result["results"]
+    return {
+        "drug": drug_name,
+        "count": len(result["results"]),
+        "results": result["results"],
+    }
 
 if __name__ == "__main__":
     if os.getenv("MCP_TRANSPORT") == "http":
