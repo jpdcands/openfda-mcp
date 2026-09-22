@@ -30,7 +30,7 @@ async def search_adverse_events(drug_name: str, limit: int = 5) -> dict:
                     f'patient.drug.medicinalproduct:"{drug_name}"'
                     ' AND patient.drug.drugcharacterization:1'
                 ),
-                "limit": min(limit * 4, 100),
+                "limit": 100,
             },
         )
         response.raise_for_status()
