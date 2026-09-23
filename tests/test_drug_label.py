@@ -10,7 +10,10 @@ from fastmcp import Client
 
 import main
 from label_format import MAX_TOTAL_CHARS, summarize_label
-from openfda_client import choose_term, is_repackager, pick_label, search_drug_label
+from openfda_client import (
+    choose_manufacturers, choose_term, is_modified_release, is_repackager,
+    pick_label, search_drug_label, split_release_request,
+)
 
 # Claude's MCP clients cut tool output off at 25,000 tokens.
 # JSON runs roughly 4 characters per token, so stay well under 100,000 chars.
@@ -124,6 +127,65 @@ def test_repackager_used_when_nothing_else_exists():
     assert pick_label(labels)["openfda"]["manufacturer_name"] == ["REMEDYREPACK INC."]
 
 
+def test_manufacturer_list_drops_repackagers():
+    makers = [
+        {"term": "Cardinal Health 107, LLC", "count": 9},
+        {"term": "E.R. Squibb & Sons, L.L.C.", "count": 2},
+        {"term": "REMEDYREPACK INC.", "count": 5},
+    ]
+    assert choose_manufacturers(makers) == ["E.R. Squibb & Sons, L.L.C."]
+
+
+def test_manufacturer_list_empty_when_all_repackagers():
+    assert choose_manufacturers([{"term": "NuCare Pharmaceuticals", "count": 3}]) == []
+
+
+# --- Immediate or extended release? --------------------------------------------
+
+def _label(maker: str, date: str, indication: str) -> dict:
+    return {"effective_time": date,
+            "openfda": {"manufacturer_name": [maker]},
+            "indications_and_usage": [indication]}
+
+
+IR = "Metformin hydrochloride tablets are indicated as an adjunct to diet and exercise."
+ER = "Metformin hydrochloride extended-release tablets is indicated as an adjunct."
+
+
+@pytest.mark.parametrize("typed, expected", [
+    ("metformin", ("metformin", False)),
+    ("metformin ER", ("metformin", True)),
+    ("Metformin XR", ("Metformin", True)),
+    ("nifedipine extended-release", ("nifedipine", True)),
+    ("sitagliptin and metformin", ("sitagliptin and metformin", False)),
+])
+def test_release_words_are_split_off(typed, expected):
+    assert split_release_request(typed) == expected
+
+
+def test_modified_release_is_recognised():
+    assert is_modified_release(_label("Laurus", "1", ER))
+    assert not is_modified_release(_label("Zydus", "1", IR))
+
+
+def test_immediate_release_preferred_even_if_older():
+    labels = [_label("Laurus Labs Limited", "20260519", ER),
+              _label("Zydus Pharmaceuticals", "20250101", IR)]
+    assert pick_label(labels)["indications_and_usage"] == [IR]
+
+
+def test_extended_release_when_asked_for():
+    labels = [_label("Laurus Labs Limited", "20260519", ER),
+              _label("Zydus Pharmaceuticals", "20250101", IR)]
+    assert pick_label(labels, wants_mr=True)["indications_and_usage"] == [ER]
+
+
+def test_manufacturer_still_beats_release_type():
+    labels = [_label("REMEDYREPACK INC.", "20260821", IR),
+              _label("Laurus Labs Limited", "20260519", ER)]
+    assert pick_label(labels)["openfda"]["manufacturer_name"] == ["Laurus Labs Limited"]
+
+
 # --- How big is the answer? --------------------------------------------------
 
 def test_summary_drops_tables_and_stays_small():
@@ -150,7 +212,8 @@ async def test_tool_output_fits_client_limit(monkeypatch):
     """Call the tool through a real MCP client, as Claude would."""
     async def fake_search(name):
         return {"label": fake_label(), "match": "test", "matched_name": name,
-                "label_source": "manufacturer", "other_names": []}
+                "label_source": "manufacturer", "release": "immediate",
+                "other_names": []}
 
     monkeypatch.setattr(main, "search_drug_label", fake_search)
     async with Client(main.mcp) as client:
@@ -179,6 +242,38 @@ async def test_live_metformin_label_is_from_original_manufacturer():
     result = await search_drug_label("metformin")
     maker = result["label"]["openfda"].get("manufacturer_name")
     assert result["label_source"] == "manufacturer", f"got repackager {maker}"
+
+
+@pytest.mark.live
+@pytest.mark.anyio
+async def test_live_brand_repackager_is_flagged_when_no_original_is_indexed():
+    # Checked by hand (Sep 2026): every label OpenFDA indexes under the brand
+    # name ELIQUIS is from a repackager (A-S Medication, Aphena, Cardinal
+    # Health, Proficient Rx); Bristol-Myers Squibb's own label isn't tagged
+    # with that brand name. The server can't return what isn't indexed, but
+    # it must still answer AND say honestly that the label is a repackager's.
+    result = await search_drug_label("Eliquis")
+    assert result["label"] is not None
+    assert result["label"]["openfda"]["generic_name"] == ["APIXABAN"]
+    assert result["label_source"] == (
+        "repackager" if is_repackager(result["label"]) else "manufacturer"
+    )
+
+
+@pytest.mark.live
+@pytest.mark.anyio
+async def test_live_metformin_defaults_to_immediate_release():
+    result = await search_drug_label("metformin")
+    maker = result["label"]["openfda"].get("manufacturer_name")
+    assert result["release"] == "immediate", f"got modified release from {maker}"
+
+
+@pytest.mark.live
+@pytest.mark.anyio
+async def test_live_metformin_er_returns_extended_release():
+    result = await search_drug_label("metformin ER")
+    assert result["matched_name"] == "METFORMIN HYDROCHLORIDE"
+    assert result["release"] != "immediate"
 
 
 @pytest.mark.live

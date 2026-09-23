@@ -99,42 +99,119 @@ REPACKAGER_MARKERS = [
 ]
 
 
+def is_repackager_name(name: str) -> bool:
+    n = name.upper()
+    return any(m in n for m in REPACKAGER_MARKERS)
+
+
 def is_repackager(label: dict) -> bool:
     names = label.get("openfda", {}).get("manufacturer_name", [])
-    return any(m in n.upper() for n in names for m in REPACKAGER_MARKERS)
+    return any(is_repackager_name(n) for n in names)
 
 
-def pick_label(results: list[dict]) -> dict:
-    """Newest label from an original manufacturer; if every label is from a
-    repackager, the newest of those."""
-    originals = [r for r in results if not is_repackager(r)]
-    pool = originals or results
-    return max(pool, key=lambda r: r.get("effective_time", ""))
+# ---------------------------------------------------------------------------
+# Immediate release vs extended release
+# ---------------------------------------------------------------------------
+
+# Words a user might type to ask for a modified-release product.
+RELEASE_WORDS = {"ER", "XR", "XL", "SR", "CR", "LA", "CD", "DR", "EC",
+                 "EXTENDED-RELEASE", "EXTENDED", "DELAYED-RELEASE", "DELAYED",
+                 "SUSTAINED-RELEASE", "CONTROLLED-RELEASE", "RELEASE"}
+
+# Phrases that mark a label as modified release.
+MODIFIED_RELEASE_PHRASES = [
+    "extended-release", "extended release", "delayed-release",
+    "delayed release", "sustained-release", "sustained release",
+    "controlled-release", "controlled release", "modified-release",
+]
+
+
+def split_release_request(drug_name: str) -> tuple[str, bool]:
+    """'metformin ER' -> ('metformin', True); 'metformin' -> ('metformin', False)."""
+    words = drug_name.split()
+    kept = [w for w in words if w.upper() not in RELEASE_WORDS]
+    wants_mr = len(kept) < len(words)
+    return (" ".join(kept) or drug_name), wants_mr
+
+
+def is_modified_release(label: dict) -> bool:
+    """True if the label is for an extended/delayed/sustained-release product.
+
+    Looks only at the product names and the indications section; other
+    sections of an immediate-release label often mention ER products
+    (e.g. "patients switching from extended-release tablets").
+    """
+    ofda = label.get("openfda", {})
+    text = " ".join(
+        ofda.get("brand_name", [])
+        + label.get("spl_product_data_elements", [])[:1]
+        + label.get("indications_and_usage", [])[:1]
+    ).lower()
+    return any(p in text for p in MODIFIED_RELEASE_PHRASES)
+
+
+def pick_label(results: list[dict], wants_mr: bool = False) -> dict:
+    """Choose one label. In order of importance:
+      1. from an original manufacturer, not a repackager
+      2. the release type the user asked for (immediate release by default)
+      3. the newest
+    """
+    return max(results, key=lambda r: (
+        not is_repackager(r),
+        is_modified_release(r) == wants_mr,
+        r.get("effective_time", ""),
+    ))
+
+
+def choose_manufacturers(maker_terms: list[dict], limit: int = 10) -> list[str]:
+    """From an OpenFDA manufacturer count, keep original manufacturers
+    (most labels first). Empty if every one is a repackager."""
+    originals = [t for t in maker_terms if not is_repackager_name(t["term"])]
+    originals.sort(key=lambda t: -t["count"])
+    return [t["term"] for t in originals[:limit]]
+
+
+def _quote(value: str) -> str:
+    return '"' + value.replace('"', "") + '"'
 
 
 async def search_drug_label(drug_name: str) -> dict:
     """Find the FDA label that best matches drug_name.
 
-    Returns {"label": <raw label or None>, "match": <how it matched>,
-             "matched_name": <the OpenFDA name used>}.
+    Returns {"label", "match", "matched_name", "label_source",
+             "release", "other_names"}.
     """
+    name, wants_mr = split_release_request(drug_name)
+
     async with httpx.AsyncClient(params=DEFAULT_PARAMS, timeout=30) as client:
         brand_terms, generic_terms = await asyncio.gather(
-            _count(client, "brand_name", drug_name),
-            _count(client, "generic_name", drug_name),
+            _count(client, "brand_name", name),
+            _count(client, "generic_name", name),
         )
-        choice = choose_term(drug_name, brand_terms, generic_terms)
+        choice = choose_term(name, brand_terms, generic_terms)
 
         if choice:
             field, term, match = choice
-            search = f'{field}:"{term}"'
+            search = f"{field}:{_quote(term)}"
         else:
             # Nothing matched cleanly; fall back to the broad search and say so.
-            term, match = drug_name, "approximate (no exact or single-ingredient match)"
+            term, match = name, "approximate (no exact or single-ingredient match)"
             search = (
-                f'openfda.brand_name:"{drug_name}"'
-                f' OR openfda.generic_name:"{drug_name}"'
+                f"openfda.brand_name:{_quote(name)}"
+                f" OR openfda.generic_name:{_quote(name)}"
             )
+
+        # Which companies have a label for this product? Ask for the original
+        # manufacturers' labels directly, so repackagers can't crowd them out.
+        makers = await _get(client, {
+            "search": search, "count": "openfda.manufacturer_name.exact",
+        })
+        originals = choose_manufacturers(makers.get("results", []))
+        if originals:
+            wanted = " OR ".join(
+                f"openfda.manufacturer_name.exact:{_quote(m)}" for m in originals
+            )
+            search = f"({search}) AND ({wanted})"
 
         data = await _get(client, {"search": search, "limit": 25})
 
@@ -151,10 +228,13 @@ async def search_drug_label(drug_name: str) -> dict:
         return {"label": None, "match": None, "matched_name": None,
                 "other_names": others}
 
-    label = pick_label(results)
-    return {"label": label, "match": match, "matched_name": term,
-            "label_source": "repackager" if is_repackager(label) else "manufacturer",
-            "other_names": others}
+    label = pick_label(results, wants_mr)
+    return {
+        "label": label, "match": match, "matched_name": term,
+        "label_source": "repackager" if is_repackager(label) else "manufacturer",
+        "release": "modified (ER/DR/SR)" if is_modified_release(label) else "immediate",
+        "other_names": others,
+    }
 
 
 async def search_adverse_events(drug_name: str, limit: int = 5) -> dict:

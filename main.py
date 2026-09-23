@@ -13,6 +13,9 @@ async def get_drug_label(drug_name: str, sections: list[str] | None = None) -> d
     Plain generic names match the single-ingredient product
     (e.g. "metformin" -> metformin hydrochloride, not a combination).
     Type the combination to get one (e.g. "sitagliptin and metformin").
+    Immediate-release labels are preferred; add ER, XR, DR, SR etc. to ask
+    for a modified-release product (e.g. "metformin ER").
+    Original manufacturers' labels are preferred over repackagers'.
 
     By default returns boxed warning, indications, dosage, contraindications
     and warnings, each capped in length. Pass `sections` to ask for others:
@@ -29,7 +32,8 @@ async def get_drug_label(drug_name: str, sections: list[str] | None = None) -> d
     summary = summarize_label(result["label"], sections)
     return {"query": drug_name, "match": result["match"],
             "matched_name": result["matched_name"],
-            "label_source": result["label_source"], **summary,
+            "label_source": result["label_source"],
+            "release": result["release"], **summary,
             "other_names": result["other_names"]}
 
 @mcp.tool()
