@@ -203,13 +203,26 @@ def panel_labeler_codes(label: dict) -> set[str]:
     return set(NDC_PATTERN.findall(panel))
 
 
-def original_ndc_products(products: list[dict]) -> dict[str, dict]:
-    """NDC directory entries -> {labeler code: entry} for non-repackagers."""
+def original_ndc_products(products: list[dict], name: str = "") -> dict[str, dict]:
+    """NDC directory entries -> {labeler code: entry} for non-repackagers.
+
+    A company often has several entries for one drug (e.g. ELIQUIS tablets,
+    ELIQUIS 30-Day Starter Pack, ELIQUIS SPRINKLE). The entry used to describe
+    the label is the one whose brand or generic name is exactly what was
+    searched for, preferring one that lists a route.
+    """
+    def fit(p: dict) -> tuple:
+        exact = name.upper() in (p.get("brand_name", "").upper(),
+                                 p.get("generic_name", "").upper())
+        return (exact, bool(p.get("route")))
+
     found = {}
     for p in products:
         code = p.get("product_ndc", "").split("-")[0]
-        if code and not is_repackager_name(p.get("labeler_name", "")):
-            found.setdefault(code, p)
+        if not code or is_repackager_name(p.get("labeler_name", "")):
+            continue
+        if code not in found or fit(p) > fit(found[code]):
+            found[code] = p
     return found
 
 
@@ -301,7 +314,7 @@ async def search_drug_label(drug_name: str) -> dict:
             ndc = await _get_url(client, NDC_URL, {
                 "search": f"{ndc_field}:{_quote(term)}", "limit": 100,
             })
-            ndc_originals = original_ndc_products(ndc.get("results", []))
+            ndc_originals = original_ndc_products(ndc.get("results", []), term)
             if ndc_originals:
                 text_hits = await _get(client, {
                     "search": f"spl_product_data_elements:{_quote(term)}",

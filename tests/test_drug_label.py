@@ -147,6 +147,10 @@ def test_manufacturer_list_empty_when_all_repackagers():
 ELIQUIS_NDC_DIRECTORY = [
     {"product_ndc": "70518-4462", "labeler_name": "REMEDYREPACK INC."},
     {"product_ndc": "82804-085", "labeler_name": "Proficient Rx LP"},
+    # Listed first on purpose: the real directory returned the starter pack
+    # before the tablets, and the label ended up described as the starter pack.
+    {"product_ndc": "0003-3765", "labeler_name": "E.R. Squibb & Sons, L.L.C.",
+     "brand_name": "ELIQUIS 30-Day Starter Pack", "generic_name": "apixaban"},
     {"product_ndc": "0003-0893", "labeler_name": "E.R. Squibb & Sons, L.L.C.",
      "brand_name": "Eliquis", "generic_name": "apixaban", "route": ["ORAL"]},
     {"product_ndc": "55154-0612", "labeler_name": "Cardinal Health 107, LLC"},
@@ -184,6 +188,14 @@ def test_untagged_original_chosen_over_copycat_and_sprinkle():
         "package_label_principal_display_panel"]
     assert label["openfda"]["manufacturer_name"] == ["E.R. Squibb & Sons, L.L.C."]
     assert label["openfda"]["generic_name"] == ["APIXABAN"]
+
+
+def test_untagged_label_described_by_the_plain_product_entry():
+    originals = original_ndc_products(ELIQUIS_NDC_DIRECTORY, "ELIQUIS")
+    assert originals["0003"]["brand_name"] == "Eliquis"
+    label = pick_untagged_original([BMS_TABLETS], originals)
+    assert label["openfda"]["brand_name"] == ["Eliquis"]
+    assert label["openfda"]["route"] == ["ORAL"]
 
 
 def test_no_untagged_original_when_no_carton_matches():
@@ -305,6 +317,8 @@ async def test_live_eliquis_comes_from_bristol_myers_squibb():
     assert result["label_source"].startswith("manufacturer"), result["label_source"]
     assert "SQUIBB" in label["openfda"]["manufacturer_name"][0].upper()
     assert " ".join(label["spl_product_data_elements"][:1]).upper().startswith("ELIQUIS APIXABAN")
+    assert label["openfda"]["brand_name"][0].upper() == "ELIQUIS", label["openfda"]["brand_name"]
+    assert label["openfda"]["route"], "route is blank"
 
 
 @pytest.mark.live
