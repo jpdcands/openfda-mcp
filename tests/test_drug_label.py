@@ -12,7 +12,8 @@ import main
 from label_format import MAX_TOTAL_CHARS, summarize_label
 from openfda_client import (
     choose_manufacturers, choose_term, is_modified_release, is_repackager,
-    pick_label, search_drug_label, split_release_request,
+    original_ndc_products, panel_labeler_codes, pick_label,
+    pick_untagged_original, search_drug_label, split_release_request,
 )
 
 # Claude's MCP clients cut tool output off at 25,000 tokens.
@@ -140,6 +141,56 @@ def test_manufacturer_list_empty_when_all_repackagers():
     assert choose_manufacturers([{"term": "NuCare Pharmaceuticals", "count": 3}]) == []
 
 
+# --- Untagged labels, identified by the NDC on the carton ------------------------
+# Modelled on what OpenFDA really returned for ELIQUIS (Sep 2026).
+
+ELIQUIS_NDC_DIRECTORY = [
+    {"product_ndc": "70518-4462", "labeler_name": "REMEDYREPACK INC."},
+    {"product_ndc": "82804-085", "labeler_name": "Proficient Rx LP"},
+    {"product_ndc": "0003-0893", "labeler_name": "E.R. Squibb & Sons, L.L.C.",
+     "brand_name": "Eliquis", "generic_name": "apixaban", "route": ["ORAL"]},
+    {"product_ndc": "55154-0612", "labeler_name": "Cardinal Health 107, LLC"},
+]
+
+
+def _untagged(product: str, panel: str, date: str) -> dict:
+    return {"effective_time": date, "spl_product_data_elements": [product],
+            "package_label_principal_display_panel": [panel],
+            "indications_and_usage": ["ELIQUIS is a factor Xa inhibitor indicated"]}
+
+
+BMS_TABLETS = _untagged("ELIQUIS apixaban ANHYDROUS LACTOSE",
+                        "NDC 0003-0893-21 ELIQUIS 5 mg 60 tablets", "20260130")
+BMS_SPRINKLE = _untagged("ELIQUIS SPRINKLE apixaban",
+                         "NDC 0003-3764-11 ELIQUIS SPRINKLE 0.15 mg", "20260401")
+# A repackager that copied "Marketed by: Bristol-Myers Squibb" but has its own NDC.
+COPYCAT = _untagged("ELIQUIS APIXABAN ANHYDROUS LACTOSE",
+                    "ELIQUIS 5 mg Representative Packaging NDC 82982-054-30", "20260601")
+
+
+def test_carton_ndc_labeler_codes_are_read():
+    assert panel_labeler_codes(BMS_TABLETS) == {"0003"}
+    assert panel_labeler_codes(COPYCAT) == {"82982"}
+
+
+def test_ndc_directory_keeps_only_original_companies():
+    assert list(original_ndc_products(ELIQUIS_NDC_DIRECTORY)) == ["0003"]
+
+
+def test_untagged_original_chosen_over_copycat_and_sprinkle():
+    originals = original_ndc_products(ELIQUIS_NDC_DIRECTORY)
+    label = pick_untagged_original([COPYCAT, BMS_SPRINKLE, BMS_TABLETS], originals)
+    assert label["package_label_principal_display_panel"] == BMS_TABLETS[
+        "package_label_principal_display_panel"]
+    assert label["openfda"]["manufacturer_name"] == ["E.R. Squibb & Sons, L.L.C."]
+    assert label["openfda"]["generic_name"] == ["APIXABAN"]
+
+
+def test_no_untagged_original_when_no_carton_matches():
+    originals = original_ndc_products(ELIQUIS_NDC_DIRECTORY)
+    assert pick_untagged_original([COPYCAT], originals) is None
+
+
 # --- Immediate or extended release? --------------------------------------------
 
 def _label(maker: str, date: str, indication: str) -> dict:
@@ -246,18 +297,14 @@ async def test_live_metformin_label_is_from_original_manufacturer():
 
 @pytest.mark.live
 @pytest.mark.anyio
-async def test_live_brand_repackager_is_flagged_when_no_original_is_indexed():
-    # Checked by hand (Sep 2026): every label OpenFDA indexes under the brand
-    # name ELIQUIS is from a repackager (A-S Medication, Aphena, Cardinal
-    # Health, Proficient Rx); Bristol-Myers Squibb's own label isn't tagged
-    # with that brand name. The server can't return what isn't indexed, but
-    # it must still answer AND say honestly that the label is a repackager's.
+async def test_live_eliquis_comes_from_bristol_myers_squibb():
+    # Every label OpenFDA tags as ELIQUIS is a repackager's; Bristol-Myers
+    # Squibb's own label is untagged and must be found by its carton NDC (0003).
     result = await search_drug_label("Eliquis")
-    assert result["label"] is not None
-    assert result["label"]["openfda"]["generic_name"] == ["APIXABAN"]
-    assert result["label_source"] == (
-        "repackager" if is_repackager(result["label"]) else "manufacturer"
-    )
+    label = result["label"]
+    assert result["label_source"].startswith("manufacturer"), result["label_source"]
+    assert "SQUIBB" in label["openfda"]["manufacturer_name"][0].upper()
+    assert " ".join(label["spl_product_data_elements"][:1]).upper().startswith("ELIQUIS APIXABAN")
 
 
 @pytest.mark.live

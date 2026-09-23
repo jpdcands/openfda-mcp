@@ -1,5 +1,6 @@
 import asyncio
 import os
+import re
 
 import httpx
 
@@ -8,6 +9,7 @@ BASE_URL = "https://api.fda.gov"
 API_KEY = os.getenv("OPENFDA_API_KEY")  # optional; raises the daily rate limit
 DEFAULT_PARAMS = {"api_key": API_KEY} if API_KEY else {}
 LABEL_URL = f"{BASE_URL}/drug/label.json"
+NDC_URL = f"{BASE_URL}/drug/ndc.json"
 
 
 # ---------------------------------------------------------------------------
@@ -62,7 +64,11 @@ def choose_term(query: str, brand_terms: list[dict], generic_terms: list[dict]):
 
 
 async def _get(client: httpx.AsyncClient, params: dict) -> dict:
-    response = await client.get(LABEL_URL, params=params)
+    return await _get_url(client, LABEL_URL, params)
+
+
+async def _get_url(client: httpx.AsyncClient, url: str, params: dict) -> dict:
+    response = await client.get(url, params=params)
     # OpenFDA answers "no matches" with a 404 rather than an empty list.
     if response.status_code == 404:
         return {"results": []}
@@ -175,6 +181,78 @@ def _quote(value: str) -> str:
     return '"' + value.replace('"', "") + '"'
 
 
+# ---------------------------------------------------------------------------
+# Untagged labels: identify the company by the NDC printed on the carton
+# ---------------------------------------------------------------------------
+#
+# Some labels, including brand manufacturers' own (e.g. Bristol-Myers
+# Squibb's ELIQUIS), carry no OpenFDA tags, so a brand-name search only finds
+# repackagers. The label text can't be trusted to name the company either:
+# repackagers copy "Marketed by: Bristol-Myers Squibb" word for word. What
+# they can't copy is the NDC on their own carton. So:
+#   1. the FDA NDC directory says which labeler code belongs to which company
+#   2. drop the repackagers -> the original company's code(s), e.g. 0003
+#   3. pick the label whose carton (principal display panel) shows that code
+
+NDC_PATTERN = re.compile(r"\b(\d{4,5})-\d{3,4}-\d{1,2}\b")
+
+
+def panel_labeler_codes(label: dict) -> set[str]:
+    """Labeler codes of the NDCs printed on the label's carton."""
+    panel = " ".join(label.get("package_label_principal_display_panel", []))
+    return set(NDC_PATTERN.findall(panel))
+
+
+def original_ndc_products(products: list[dict]) -> dict[str, dict]:
+    """NDC directory entries -> {labeler code: entry} for non-repackagers."""
+    found = {}
+    for p in products:
+        code = p.get("product_ndc", "").split("-")[0]
+        if code and not is_repackager_name(p.get("labeler_name", "")):
+            found.setdefault(code, p)
+    return found
+
+
+def is_plain_product(label: dict, brand: str, generic: str) -> bool:
+    """True for 'ELIQUIS apixaban ...', False for variants such as
+    'ELIQUIS SPRINKLE apixaban ...' filed as a separate label."""
+    first = " ".join(label.get("spl_product_data_elements", [])[:1]).upper()
+    return first.startswith(f"{brand} {generic}".upper())
+
+
+def pick_untagged_original(results: list[dict], originals: dict[str, dict],
+                           wants_mr: bool = False) -> dict | None:
+    """Among labels found by text search, choose one whose carton NDC belongs
+    to an original company. Returns a copy with OpenFDA-style tags filled in
+    from the NDC directory, or None if no carton matches."""
+    candidates = []
+    for r in results:
+        codes = panel_labeler_codes(r) & originals.keys()
+        if codes:
+            candidates.append((r, originals[sorted(codes)[0]]))
+    if not candidates:
+        return None
+
+    def rank(item):
+        label, product = item
+        return (
+            is_plain_product(label, product.get("brand_name", ""),
+                             product.get("generic_name", "")),
+            is_modified_release(label) == wants_mr,
+            label.get("effective_time", ""),
+        )
+
+    label, product = max(candidates, key=rank)
+    label = dict(label)
+    label["openfda"] = {
+        "brand_name": [product.get("brand_name", "")],
+        "generic_name": [product.get("generic_name", "").upper()],
+        "manufacturer_name": [product.get("labeler_name", "")],
+        "route": product.get("route", []),
+    }
+    return label
+
+
 async def search_drug_label(drug_name: str) -> dict:
     """Find the FDA label that best matches drug_name.
 
@@ -215,6 +293,24 @@ async def search_drug_label(drug_name: str) -> dict:
 
         data = await _get(client, {"search": search, "limit": 25})
 
+        # Every tagged label is a repackager's: look for the original
+        # company's untagged label, identified by the NDC on its carton.
+        untagged = None
+        if choice and not originals:
+            ndc_field = "brand_name" if field.endswith("brand_name.exact") else "generic_name"
+            ndc = await _get_url(client, NDC_URL, {
+                "search": f"{ndc_field}:{_quote(term)}", "limit": 100,
+            })
+            ndc_originals = original_ndc_products(ndc.get("results", []))
+            if ndc_originals:
+                text_hits = await _get(client, {
+                    "search": f"spl_product_data_elements:{_quote(term)}",
+                    "limit": 25,
+                })
+                untagged = pick_untagged_original(
+                    text_hits.get("results", []), ndc_originals, wants_mr
+                )
+
     # Other generic names that also matched, most labels first, so the
     # caller can see what else exists (combinations, ER products, ...).
     others = [
@@ -223,15 +319,19 @@ async def search_drug_label(drug_name: str) -> dict:
         if t["term"] != term
     ][:5]
 
-    results = data.get("results", [])
-    if not results:
-        return {"label": None, "match": None, "matched_name": None,
-                "other_names": others}
+    if untagged:
+        label, source = untagged, "manufacturer (untagged label, matched by carton NDC)"
+    else:
+        results = data.get("results", [])
+        if not results:
+            return {"label": None, "match": None, "matched_name": None,
+                    "other_names": others}
+        label = pick_label(results, wants_mr)
+        source = "repackager" if is_repackager(label) else "manufacturer"
 
-    label = pick_label(results, wants_mr)
     return {
         "label": label, "match": match, "matched_name": term,
-        "label_source": "repackager" if is_repackager(label) else "manufacturer",
+        "label_source": source,
         "release": "modified (ER/DR/SR)" if is_modified_release(label) else "immediate",
         "other_names": others,
     }
