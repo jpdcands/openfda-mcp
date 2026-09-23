@@ -28,7 +28,8 @@ async def get_drug_label(drug_name: str, sections: list[str] | None = None) -> d
         return {"error": f"No label found for '{drug_name}'"}
     summary = summarize_label(result["label"], sections)
     return {"query": drug_name, "match": result["match"],
-            "matched_name": result["matched_name"], **summary,
+            "matched_name": result["matched_name"],
+            "label_source": result["label_source"], **summary,
             "other_names": result["other_names"]}
 
 @mcp.tool()

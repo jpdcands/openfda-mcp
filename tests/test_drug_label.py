@@ -10,7 +10,7 @@ from fastmcp import Client
 
 import main
 from label_format import MAX_TOTAL_CHARS, summarize_label
-from openfda_client import choose_term, search_drug_label
+from openfda_client import choose_term, is_repackager, pick_label, search_drug_label
 
 # Claude's MCP clients cut tool output off at 25,000 tokens.
 # JSON runs roughly 4 characters per token, so stay well under 100,000 chars.
@@ -96,6 +96,34 @@ def test_no_clean_match_returns_none():
     assert choose_term("zzz", [], METFORMIN_GENERICS) is None
 
 
+# --- Whose label? ------------------------------------------------------------
+
+def _by(maker: str, date: str) -> dict:
+    return {"effective_time": date, "openfda": {"manufacturer_name": [maker]}}
+
+
+def test_repackagers_are_recognised():
+    assert is_repackager(_by("REMEDYREPACK INC.", "1"))
+    assert is_repackager(_by("Bryant Ranch Prepack", "1"))
+    assert not is_repackager(_by("Granules Pharmaceuticals Inc", "1"))
+
+
+def test_original_manufacturer_beats_newer_repackager():
+    labels = [
+        _by("REMEDYREPACK INC.", "20260821"),
+        _by("Granules Pharmaceuticals Inc", "20250110"),
+        _by("Zydus Pharmaceuticals USA Inc.", "20251201"),
+    ]
+    assert pick_label(labels)["openfda"]["manufacturer_name"] == [
+        "Zydus Pharmaceuticals USA Inc."
+    ]
+
+
+def test_repackager_used_when_nothing_else_exists():
+    labels = [_by("REMEDYREPACK INC.", "20260821"), _by("NuCare Pharmaceuticals", "20240101")]
+    assert pick_label(labels)["openfda"]["manufacturer_name"] == ["REMEDYREPACK INC."]
+
+
 # --- How big is the answer? --------------------------------------------------
 
 def test_summary_drops_tables_and_stays_small():
@@ -122,7 +150,7 @@ async def test_tool_output_fits_client_limit(monkeypatch):
     """Call the tool through a real MCP client, as Claude would."""
     async def fake_search(name):
         return {"label": fake_label(), "match": "test", "matched_name": name,
-                "other_names": []}
+                "label_source": "manufacturer", "other_names": []}
 
     monkeypatch.setattr(main, "search_drug_label", fake_search)
     async with Client(main.mcp) as client:
@@ -143,6 +171,14 @@ async def test_live_metformin_is_plain_metformin():
         f"got {generics}; matched {result['matched_name']!r} by "
         f"{result['match']}; other names: {result['other_names']}"
     )
+
+
+@pytest.mark.live
+@pytest.mark.anyio
+async def test_live_metformin_label_is_from_original_manufacturer():
+    result = await search_drug_label("metformin")
+    maker = result["label"]["openfda"].get("manufacturer_name")
+    assert result["label_source"] == "manufacturer", f"got repackager {maker}"
 
 
 @pytest.mark.live

@@ -82,6 +82,36 @@ async def _count(client: httpx.AsyncClient, field: str, drug_name: str) -> list[
 # Step 2: fetch the label for that product
 # ---------------------------------------------------------------------------
 
+# Repackagers and relabelers file their own copy of a manufacturer's label.
+# The clinical text is the same, but a pharmacist expects the original
+# manufacturer's label, so these are used only when nothing else exists.
+# Matched as upper-case substrings of openfda.manufacturer_name.
+REPACKAGER_MARKERS = [
+    "REPACK", "PREPACK", "RELABEL",
+    "A-S MEDICATION", "AMERICAN HEALTH PACKAGING", "APHENA", "ASCLEMED",
+    "AVKARE", "AVPAK", "BRYANT RANCH", "CARDINAL HEALTH", "COUPLER",
+    "DENTON PHARMA", "DIRECT RX", "DIRECT_RX", "GOLDEN STATE MEDICAL",
+    "HENRY SCHEIN", "LAKE ERIE MEDICAL", "MAJOR PHARMACEUTICALS",
+    "MEDSOURCE", "MEDVANTX", "NORTHWIND", "NUCARE", "PD-RX",
+    "PRECISION DOSE", "PREFERRED PHARMACEUTICALS", "PROFICIENT RX",
+    "QPHARMA", "QUALITY CARE", "READYMEDS", "SAFECOR",
+    "ST. MARY'S MEDICAL PARK", "UNIT DOSE SERVICES",
+]
+
+
+def is_repackager(label: dict) -> bool:
+    names = label.get("openfda", {}).get("manufacturer_name", [])
+    return any(m in n.upper() for n in names for m in REPACKAGER_MARKERS)
+
+
+def pick_label(results: list[dict]) -> dict:
+    """Newest label from an original manufacturer; if every label is from a
+    repackager, the newest of those."""
+    originals = [r for r in results if not is_repackager(r)]
+    pool = originals or results
+    return max(pool, key=lambda r: r.get("effective_time", ""))
+
+
 async def search_drug_label(drug_name: str) -> dict:
     """Find the FDA label that best matches drug_name.
 
@@ -106,7 +136,7 @@ async def search_drug_label(drug_name: str) -> dict:
                 f' OR openfda.generic_name:"{drug_name}"'
             )
 
-        data = await _get(client, {"search": search, "limit": 10})
+        data = await _get(client, {"search": search, "limit": 25})
 
     # Other generic names that also matched, most labels first, so the
     # caller can see what else exists (combinations, ER products, ...).
@@ -121,9 +151,9 @@ async def search_drug_label(drug_name: str) -> dict:
         return {"label": None, "match": None, "matched_name": None,
                 "other_names": others}
 
-    # Several manufacturers may file the same drug; take the newest label.
-    newest = max(results, key=lambda r: r.get("effective_time", ""))
-    return {"label": newest, "match": match, "matched_name": term,
+    label = pick_label(results)
+    return {"label": label, "match": match, "matched_name": term,
+            "label_source": "repackager" if is_repackager(label) else "manufacturer",
             "other_names": others}
 
 
