@@ -9,3 +9,16 @@ dependencies = [
     "httpx>=0.28.1",
     "python-dotenv>=1.2.2",
 ]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+markers = [
+    "live: calls the real OpenFDA API (run with: uv run pytest -m live)",
+]
+addopts = "-m 'not live'"

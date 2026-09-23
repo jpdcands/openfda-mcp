@@ -1,19 +1,35 @@
 from fastmcp import FastMCP
 from openfda_client import search_drug_label, search_adverse_events
+from label_format import summarize_label
 import os
 
 mcp = FastMCP("OpenFDA MCP Server")
 
 @mcp.tool()
-async def get_drug_label(drug_name: str) -> dict:
+async def get_drug_label(drug_name: str, sections: list[str] | None = None) -> dict:
     """
-    Look up FDA label information for a drug by brand or generic name.
-    Returns indications, warnings, dosage, and contraindications.
+    Look up the FDA label for a drug by brand or generic name.
+
+    Plain generic names match the single-ingredient product
+    (e.g. "metformin" -> metformin hydrochloride, not a combination).
+    Type the combination to get one (e.g. "sitagliptin and metformin").
+
+    By default returns boxed warning, indications, dosage, contraindications
+    and warnings, each capped in length. Pass `sections` to ask for others:
+    boxed_warning, indications_and_usage, dosage_and_administration,
+    contraindications, warnings_and_cautions, warnings,
+    dosage_forms_and_strengths, adverse_reactions, drug_interactions,
+    use_in_specific_populations, pregnancy, lactation, pediatric_use,
+    geriatric_use, renal_impairment, hepatic_impairment, overdosage,
+    mechanism_of_action, pharmacokinetics, how_supplied, storage_and_handling.
     """
     result = await search_drug_label(drug_name)
-    if not result.get("results"):
+    if result["label"] is None:
         return {"error": f"No label found for '{drug_name}'"}
-    return result["results"][0]
+    summary = summarize_label(result["label"], sections)
+    return {"query": drug_name, "match": result["match"],
+            "matched_name": result["matched_name"], **summary,
+            "other_names": result["other_names"]}
 
 @mcp.tool()
 async def get_adverse_events(drug_name: str, limit: int = 5) -> dict:
