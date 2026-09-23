@@ -1,6 +1,7 @@
 from fastmcp import FastMCP
 from openfda_client import search_drug_label, search_adverse_events
 from label_format import summarize_label
+from faers_format import CAUTION, compact_report
 import os
 
 mcp = FastMCP("OpenFDA MCP Server")
@@ -39,15 +40,23 @@ async def get_drug_label(drug_name: str, sections: list[str] | None = None) -> d
 @mcp.tool()
 async def get_adverse_events(drug_name: str, limit: int = 5) -> dict:
     """
-    Retrieve recent adverse event reports for a drug from FAERS.
+    Summarize FAERS adverse event reports for a drug (brand name, generic
+    name or active ingredient).
+
+    Returns an overview across ALL matching reports (total, serious, deaths,
+    top 10 reactions) plus the newest individual reports (default 5, max 10)
+    in which this drug is marked suspect, decoded into plain terms.
+    FAERS reports are unverified and do not establish causation.
     """
+    limit = max(1, min(limit, 10))
     result = await search_adverse_events(drug_name, limit)
-    if not result.get("results"):
+    if not result["summary"]["total_reports"]:
         return {"error": f"No adverse event reports found for '{drug_name}'"}
     return {
         "drug": drug_name,
-        "count": len(result["results"]),
-        "results": result["results"],
+        "caution": CAUTION,
+        "summary": result["summary"],
+        "newest_reports": [compact_report(r) for r in result["reports"]],
     }
 
 if __name__ == "__main__":

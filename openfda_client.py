@@ -4,6 +4,8 @@ import re
 
 import httpx
 
+from faers_format import is_suspect_for, summarize_counts
+
 
 BASE_URL = "https://api.fda.gov"
 API_KEY = os.getenv("OPENFDA_API_KEY")  # optional; raises the daily rate limit
@@ -350,33 +352,47 @@ async def search_drug_label(drug_name: str) -> dict:
     }
 
 
+EVENT_URL = f"{BASE_URL}/drug/event.json"
+
+
+def adverse_event_search(drug_name: str) -> str:
+    """Reports naming the drug (by product name or active ingredient) in
+    which at least one drug is marked suspect."""
+    q = _quote(drug_name)
+    return (
+        f"(patient.drug.medicinalproduct:{q}"
+        f" OR patient.drug.activesubstance.activesubstancename:{q})"
+        " AND patient.drug.drugcharacterization:1"
+    )
+
+
 async def search_adverse_events(drug_name: str, limit: int = 5) -> dict:
-    """Search FAERS for reports where drug_name is the suspect drug."""
-    async with httpx.AsyncClient(params=DEFAULT_PARAMS) as client:
-        response = await client.get(
-            f"{BASE_URL}/drug/event.json",
-            params={
-                "search": (
-                    f'patient.drug.medicinalproduct:"{drug_name}"'
-                    ' AND patient.drug.drugcharacterization:1'
-                ),
-                "limit": 100,
-            },
+    """Overview counts plus the newest reports in which THIS drug is suspect.
+
+    Returns {"summary": {...}, "reports": [raw FAERS reports]}.
+    """
+    search = adverse_event_search(drug_name)
+
+    async def count(field: str, n: int = 10) -> list[dict]:
+        data = await _get_url(client, EVENT_URL,
+                              {"search": search, "count": field, "limit": n})
+        return data.get("results", [])
+
+    async with httpx.AsyncClient(params=DEFAULT_PARAMS, timeout=30) as client:
+        newest, serious, deaths, reactions = await asyncio.gather(
+            _get_url(client, EVENT_URL, {
+                "search": search, "sort": "receivedate:desc", "limit": 50,
+            }),
+            count("serious"),
+            count("seriousnessdeath"),
+            count("patient.reaction.reactionmeddrapt.exact"),
         )
-        response.raise_for_status()
-        data = response.json()
 
-    # Double-check: keep a report only if THIS drug is marked suspect (1)
-    name = drug_name.lower()
-    kept = []
-    for report in data.get("results", []):
-        for drug in report.get("patient", {}).get("drug", []):
-            if (
-                name in drug.get("medicinalproduct", "").lower()
-                and drug.get("drugcharacterization") == "1"
-            ):
-                kept.append(report)
-                break
-
-    data["results"] = kept[:limit]
-    return data
+    total = newest.get("meta", {}).get("results", {}).get("total", 0)
+    # The search can't tie "suspect" to the same drug entry as the name, so
+    # keep only reports where the queried drug ITSELF is marked suspect.
+    kept = [r for r in newest.get("results", []) if is_suspect_for(r, drug_name)]
+    return {
+        "summary": summarize_counts(total, serious, deaths, reactions),
+        "reports": kept[:limit],
+    }
